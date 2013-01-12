@@ -1,0 +1,1942 @@
+--
+-- PostgreSQL database dump
+--
+
+-- Dumped from database version 9.2.1
+-- Dumped by pg_dump version 9.2.0
+-- Started on 2013-01-12 14:49:37
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SET check_function_bodies = false;
+SET client_min_messages = warning;
+
+--
+-- TOC entry 7 (class 2615 OID 16395)
+-- Name: gks; Type: SCHEMA; Schema: -; Owner: postgres
+--
+
+CREATE SCHEMA gks;
+
+
+ALTER SCHEMA gks OWNER TO postgres;
+
+SET search_path = gks, pg_catalog;
+
+--
+-- TOC entry 226 (class 1255 OID 49196)
+-- Name: f_period_begin(integer); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_period_begin(per integer) RETURNS date
+    LANGUAGE sql STABLE STRICT
+    AS $$
+
+SELECT 
+	since 
+FROM 
+	gks.periods 
+WHERE periods.id = per
+limit 1
+$$;
+
+
+ALTER FUNCTION gks.f_period_begin(per integer) OWNER TO om;
+
+--
+-- TOC entry 228 (class 1255 OID 65536)
+-- Name: f_period_current(); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_period_current() RETURNS integer
+    LANGUAGE sql STABLE STRICT
+    AS $$
+SELECT per_id FROM gks.states 
+limit 1
+$$;
+
+
+ALTER FUNCTION gks.f_period_current() OWNER TO om;
+
+--
+-- TOC entry 227 (class 1255 OID 49195)
+-- Name: f_period_end(integer); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_period_end(per integer) RETURNS date
+    LANGUAGE sql STABLE STRICT
+    AS $$
+SELECT 
+	since 
+FROM 
+	gks.periods 
+WHERE periods.id > per
+limit 1
+$$;
+
+
+ALTER FUNCTION gks.f_period_end(per integer) OWNER TO om;
+
+--
+-- TOC entry 233 (class 1255 OID 65558)
+-- Name: calc_account(integer, date, date); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION calc_account(_acc integer, _since date DEFAULT f_period_begin(f_period_current()), _finish date DEFAULT f_period_end(f_period_current())) RETURNS TABLE(acc integer, since date, days integer, srv_id integer, isod boolean, credsum real, countsum real, rclcsum real)
+    LANGUAGE plpgsql
+    AS $$
+declare 
+	rec record; -- Курсор, который проходит все даты, относящиеся к лицевому счёту
+	srec record; -- Курсор, который проходит все услуги, относящиеся к лицевому счёту
+	horec record; -- Курсор для таблицы Houses
+	prev_date date; -- Переменная для запоминания предыдущей даты, для нахождения еоличества дней
+	hrec gks.histories%RowTYPE; -- Курсор для таблицы Histories
+	srv_price real; -- Стоимость услуги
+	per_days int; -- Количество дней в периоде
+	accs_for_counter int; -- Количество счётов к которым подключен счётчик
+	acc_since date; -- дата начала действия счёта
+	acc_finish date; -- дата окончания действия счёта
+	counter_val real; -- Объём по счётчику
+	val_for_house real; -- Объём по счётчику и по нормативу услуг для дома
+	house_sql real; -- Отапливаемая площадь дома
+BEGIN
+	prev_date = null; 
+	per_days = _finish - _since;
+
+-- id дома
+	SELECT houses.* INTO horec FROM gks.houses LEFT JOIN gks.accounts ON houses.id = accounts.hou_id WHERE accounts.acc = _acc;
+-- Запрос для определения границ начисления по ЛС
+	SELECT accounts.since, accounts.finish into acc_since, acc_finish FROM gks.accounts	WHERE accounts.acc = _acc;
+/*В этот запрос сводятся все даты, имеющие отношения к этому ЛС.*/
+
+-- цикл по всем датам, относящимся к лицевому счёту
+	for rec IN
+		SELECT accounts.acc, accounts.since FROM gks.accounts
+		WHERE accounts.acc = _acc 
+		AND accounts.since between _since and _finish
+		UNION  
+		SELECT accounts.acc, accounts.finish FROM gks.accounts
+		WHERE accounts.acc = _acc
+		AND accounts.finish between _since and _finish
+		UNION 
+		SELECT histories.acc_id, chdate FROM gks.histories 
+		WHERE histories.acc_id = _acc
+		AND chdate between _since and _finish
+		UNION 
+		SELECT serv_applications.acc_id, serv_applications.since
+		from gks.serv_applications 
+		WHERE serv_applications.acc_id = _acc
+		AND serv_applications.since between _since and _finish
+		UNION 
+		SELECT serv_applications.acc_id, serv_applications.finish
+		from gks.serv_applications 
+		WHERE serv_applications.acc_id = _acc
+		AND serv_applications.finish between _since and _finish
+		UNION 
+		SELECT acc_id, checkdate
+		FROM gks.serv_applications JOIN  gks.counter_values ON serv_applications.cnt_id = counter_values.cnt_id 	
+		WHERE acc_id = _acc
+		AND checkdate between _since and _finish
+		UNION 
+		SELECT _acc, periods.since FROM gks.periods
+		WHERE periods.since between _since and _finish
+		UNION 
+		SELECT _acc, _since
+		UNION 
+		SELECT _acc, _finish
+		ORDER BY since
+	loop
+-- первый проход пропускаем, сохраняя дату в prev_date 
+		if (prev_date is not null) then
+raise notice '1 %', prev_date;
+		   if (prev_date between coalesce(acc_since, '-infinity') and coalesce(acc_finish, 'infinity')) then 
+raise notice '2 %', prev_date;
+
+-- получаем суммарную отапливаемую площадь дома на дату prev_date
+				house_sql = (SELECT sum(sql) 
+					FROM gks.accounts 
+					LEFT JOIN gks.histories on accounts.acc=acc_id 
+					WHERE hou_id=horec.id
+					AND histories.chdate = ( SELECT max(h.chdate) AS max
+						FROM gks.histories h
+						WHERE h.acc_id = histories.acc_id AND h.chdate <= prev_date)
+					GROUP BY hou_id);
+				
+-- Получаем текущую историю
+				SELECT * INTO hrec from gks.histories WHERE histories.acc_id = _acc AND chdate <= prev_date ORDER BY chdate DESC LIMIT 1;
+			
+-- цикл по услугам лицевого счёта
+				for srec IN 
+					SELECT serv_applications.id, serv_applications.srv_id, serv_applications.coef, services.kind, serv_applications.isod, serv_applications.cnt_id 
+					from gks.serv_applications LEFT JOIN gks.services ON serv_applications.srv_id = services.id 
+					WHERE acc_id = _acc 
+					AND prev_date between coalesce(serv_applications.since, '-infinity') 
+						and coalesce(serv_applications.finish, 'infinity')
+				loop
+raise notice '3 % %', prev_date, srec.id;
+-- присваивание начальных значений
+					acc = _acc;
+					since = prev_date;
+					srv_id = srec.srv_id;
+					days = rec.since - prev_date;
+					isod = srec.isod;
+-- выбираем цену услуги
+					SELECT coalesce(sum, 0) into srv_price from gks.prices WHERE prices.srv_id = srec.srv_id AND date <= prev_date ORDER BY date DESC LIMIT 1;
+-- расчёт начисления по норме
+					if srec.cnt_id is null or srec.cnt_id = 0 then
+						credsum = srec.coef*(days::real/per_days::real)*
+							case srec.kind 
+							when 1 then srv_price*hrec.sql -- на размер площади
+							when 2 then srv_price*hrec.pes -- на количество проживающих
+							else srv_price end;
+						raise notice 'prev_date:% srec.coef:% days:% per_days:% srec.kind:% srv_price:% hrec.pes:% hrec.sql:% = %',
+							prev_date, srec.coef, days, per_days, srec.kind, srv_price, hrec.pes, hrec.sql, credsum;
+
+-- если услуга общедомовая, то дополнительно умножаем на коэффициент, полученный из деления отапливаемой площади на общею отапливаемую площадь дома
+						if srec.isod then
+-- по хорошему, надосмотреть на kind и если 0 - то делить на колво ЛСЧ в этом доме с этой услугой, 1 - на площади, и 2 - на колво человек
+							credsum = credsum * (horec.sqstair*hrec.sql/house_sql);
+						end if;
+						countsum = 0;
+-- расчёт начисления по счётчику
+					else
+						credsum = 0;
+						countsum = 0;
+--1. Находим объём по этому счётчику
+						counter_val = gks.f_get_counter_value(srec.cnt_id, prev_date);
+--2. Проверить, если в эту дату есть показание, иначе лесом./
+						if counter_val <> 0 then
+--3а. Если это не общедомовой, то находим кол-во лиц.счетов, к которым подключен это счётчик и делим поровну.
+							accs_for_counter = 0;
+							if NOT srec.isod then
+								accs_for_counter = (SELECT count(*) FROM gks.serv_applications WHERE cnt_id = srec.cnt_id);
+								countsum = srec.coef*srv_price*counter_val/accs_for_counter;
+/*3б. Если общедомовой, то по дому суммируем:
+	- все нормы(коэффициенты) по этой услуге за текущий период для не счётчика, 
+	- все объёмы по счётчикам по этой услуге за текущий период, 
+	- отнимаем из объёма счётчика этот объём. 
+	Остаток, если положительный, умножаем на цену и на коэффициент, полученный от деления общей площади на площадь дома. */					
+							else
+								val_for_house = counter_val-
+									(SELECT sum(case when serv_applications.cnt_id is null then coalesce(coef,0) else coalesce(coef,0)*coalesce(gks.f_get_counter_current_sum(serv_applications.cnt_id), 0) end)
+										FROM gks.accounts 
+										LEFT JOIN gks.serv_applications ON serv_applications.acc_id = accounts.acc
+										WHERE hou_id = horec.id
+										AND serv_applications.srv_id = srec.srv_id
+										AND serv_applications.isod = false
+										AND prev_date between coalesce(serv_applications.since, '-infinity') and coalesce(serv_applications.finish, 'infinity')
+										AND (coalesce(serv_applications.since, '-infinity'), coalesce(serv_applications.finish, 'infinity')) overlaps (_since, _finish)); 
+								countsum = srec.coef * srv_price * val_for_house * (horec.sqstair*hrec.sql/house_sql);
+raise notice 'srec.coef=(%) * srv_price(%) * val_for_house(%) * (horec.sqstair(%)*hrec.sql(%)/house_sql(%))(%)', 
+	srec.coef, srv_price, val_for_house, horec.sqstair, hrec.sql, house_sql, (horec.sqstair*hrec.sql/house_sql);
+							end if;
+						else
+							credsum = 0;
+							countsum = 0;
+						end if;
+					end if;
+-- расчёт перерасчёта
+					rclcsum = srec.coef*(days::real/per_days::real);
+					return next;
+				end loop;
+			end if; -- проверка на границы начисления лицевого счёта
+		end if;
+		prev_date = rec.since;
+	end loop;
+END;
+$$;
+
+
+ALTER FUNCTION gks.calc_account(_acc integer, _since date, _finish date) OWNER TO om;
+
+--
+-- TOC entry 229 (class 1255 OID 90125)
+-- Name: f_get_counter_current_sum(integer); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_get_counter_current_sum(_cnt_id integer) RETURNS real
+    LANGUAGE sql STABLE STRICT
+    AS $$SELECT sum(gks.f_get_counter_value(cnt_id, checkdate))
+	FROM gks.counter_values 
+	WHERE cnt_id = _cnt_id 
+	AND checkdate between gks.f_period_begin(gks.f_period_current()) AND gks.f_period_end(gks.f_period_current())$$;
+
+
+ALTER FUNCTION gks.f_get_counter_current_sum(_cnt_id integer) OWNER TO om;
+
+--
+-- TOC entry 231 (class 1255 OID 73732)
+-- Name: f_get_counter_value(integer, date); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_get_counter_value(_cnt_id integer, _cdate date) RETURNS real
+    LANGUAGE plpgsql STABLE
+    AS $_$
+begin
+	if (SELECT isnew FROM gks.counter_values where cnt_id = $1 AND checkdate=$2) = false then
+		return (SELECT reading FROM gks.counter_values where cnt_id = $1 AND checkdate=$2)-
+		(SELECT reading FROM gks.counter_values where cnt_id = $1 AND checkdate < $2 ORDER BY id desc LIMIT 1);
+	end if;
+
+	return 0;
+end;
+$_$;
+
+
+ALTER FUNCTION gks.f_get_counter_value(_cnt_id integer, _cdate date) OWNER TO om;
+
+--
+-- TOC entry 230 (class 1255 OID 114690)
+-- Name: f_is_current_period(date); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_is_current_period(_date date) RETURNS boolean
+    LANGUAGE sql STABLE STRICT
+    AS $$
+SELECT _date between gks.f_period_begin(gks.f_period_current()) AND gks.f_period_end(gks.f_period_current())
+$$;
+
+
+ALTER FUNCTION gks.f_is_current_period(_date date) OWNER TO om;
+
+--
+-- TOC entry 232 (class 1255 OID 122883)
+-- Name: f_is_in_period(date, integer); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION f_is_in_period(_date date DEFAULT ('now'::text)::date, _per_id integer DEFAULT f_period_current()) RETURNS boolean
+    LANGUAGE sql STABLE STRICT
+    AS $$
+SELECT _date between gks.f_period_begin(_per_id ) AND gks.f_period_end(_per_id )
+$$;
+
+
+ALTER FUNCTION gks.f_is_in_period(_date date, _per_id integer) OWNER TO om;
+
+--
+-- TOC entry 234 (class 1255 OID 106498)
+-- Name: tg_serv_applications_check_delete(); Type: FUNCTION; Schema: gks; Owner: om
+--
+
+CREATE FUNCTION tg_serv_applications_check_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+        IF not (old.since between gks.f_period_begin(gks.f_period_current()) AND gks.f_period_end(gks.f_period_current())) THEN
+            RAISE EXCEPTION 'Дата создания услуги не в текущем периоде!';
+        END IF;
+
+        RETURN OLD;
+        --RETURN null;
+    END;
+$$;
+
+
+ALTER FUNCTION gks.tg_serv_applications_check_delete() OWNER TO om;
+
+SET default_tablespace = '';
+
+SET default_with_oids = false;
+
+--
+-- TOC entry 188 (class 1259 OID 40990)
+-- Name: accounts; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE accounts (
+    acc integer NOT NULL,
+    hou_id integer,
+    flat text,
+    since date DEFAULT ('now'::text)::date NOT NULL,
+    finish date,
+    cmt text
+);
+
+
+ALTER TABLE gks.accounts OWNER TO om;
+
+--
+-- TOC entry 187 (class 1259 OID 40973)
+-- Name: balances; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE balances (
+    id integer NOT NULL,
+    per_id integer NOT NULL,
+    acc_id integer NOT NULL,
+    beg real,
+    cred real,
+    rclc real,
+    deb real
+);
+
+
+ALTER TABLE gks.balances OWNER TO om;
+
+--
+-- TOC entry 186 (class 1259 OID 40971)
+-- Name: balances_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE balances_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.balances_id_seq OWNER TO om;
+
+--
+-- TOC entry 2174 (class 0 OID 0)
+-- Dependencies: 186
+-- Name: balances_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE balances_id_seq OWNED BY balances.id;
+
+
+--
+-- TOC entry 2175 (class 0 OID 0)
+-- Dependencies: 186
+-- Name: balances_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('balances_id_seq', 1, false);
+
+
+--
+-- TOC entry 185 (class 1259 OID 32925)
+-- Name: counter_checks; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE counter_checks (
+    id integer NOT NULL,
+    cnt_id integer NOT NULL,
+    checkdate date DEFAULT (now())::date NOT NULL,
+    nextcheck date,
+    plomba text
+);
+
+
+ALTER TABLE gks.counter_checks OWNER TO om;
+
+--
+-- TOC entry 184 (class 1259 OID 32923)
+-- Name: counter_checks_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE counter_checks_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.counter_checks_id_seq OWNER TO om;
+
+--
+-- TOC entry 2176 (class 0 OID 0)
+-- Dependencies: 184
+-- Name: counter_checks_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE counter_checks_id_seq OWNED BY counter_checks.id;
+
+
+--
+-- TOC entry 2177 (class 0 OID 0)
+-- Dependencies: 184
+-- Name: counter_checks_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('counter_checks_id_seq', 1, false);
+
+
+--
+-- TOC entry 183 (class 1259 OID 32904)
+-- Name: counter_values; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE counter_values (
+    id integer NOT NULL,
+    cnt_id integer NOT NULL,
+    checkdate date DEFAULT (now())::date NOT NULL,
+    isnew boolean DEFAULT false NOT NULL,
+    reading real NOT NULL,
+    auto boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE gks.counter_values OWNER TO om;
+
+--
+-- TOC entry 2178 (class 0 OID 0)
+-- Dependencies: 183
+-- Name: COLUMN counter_values.isnew; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN counter_values.isnew IS 'Признак сброса счётчика';
+
+
+--
+-- TOC entry 2179 (class 0 OID 0)
+-- Dependencies: 183
+-- Name: COLUMN counter_values.reading; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN counter_values.reading IS 'Показания счётчика';
+
+
+--
+-- TOC entry 182 (class 1259 OID 32902)
+-- Name: counter_values_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE counter_values_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.counter_values_id_seq OWNER TO om;
+
+--
+-- TOC entry 2180 (class 0 OID 0)
+-- Dependencies: 182
+-- Name: counter_values_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE counter_values_id_seq OWNED BY counter_values.id;
+
+
+--
+-- TOC entry 2181 (class 0 OID 0)
+-- Dependencies: 182
+-- Name: counter_values_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('counter_values_id_seq', 9, true);
+
+
+--
+-- TOC entry 181 (class 1259 OID 32886)
+-- Name: counters; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE counters (
+    id integer NOT NULL,
+    since date DEFAULT (now())::date,
+    finish date,
+    description text,
+    serial_number text
+);
+
+
+ALTER TABLE gks.counters OWNER TO om;
+
+--
+-- TOC entry 2182 (class 0 OID 0)
+-- Dependencies: 181
+-- Name: COLUMN counters.description; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN counters.description IS 'Описание';
+
+
+--
+-- TOC entry 2183 (class 0 OID 0)
+-- Dependencies: 181
+-- Name: COLUMN counters.serial_number; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN counters.serial_number IS 'Заводской номер';
+
+
+--
+-- TOC entry 180 (class 1259 OID 32884)
+-- Name: counters_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE counters_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.counters_id_seq OWNER TO om;
+
+--
+-- TOC entry 2184 (class 0 OID 0)
+-- Dependencies: 180
+-- Name: counters_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE counters_id_seq OWNED BY counters.id;
+
+
+--
+-- TOC entry 2185 (class 0 OID 0)
+-- Dependencies: 180
+-- Name: counters_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('counters_id_seq', 17, true);
+
+
+--
+-- TOC entry 179 (class 1259 OID 32873)
+-- Name: histories; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE histories (
+    id integer NOT NULL,
+    acc_id integer NOT NULL,
+    chdate date DEFAULT ('now'::text)::date NOT NULL,
+    id_owner integer,
+    sql real,
+    own date,
+    pes integer,
+    cmt text,
+    howner text
+);
+
+
+ALTER TABLE gks.histories OWNER TO om;
+
+--
+-- TOC entry 2186 (class 0 OID 0)
+-- Dependencies: 179
+-- Name: COLUMN histories.howner; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN histories.howner IS 'Фамилия владельца квартиры (ввел временно, что быне путаться  с сылками на несколько владельцев)';
+
+
+--
+-- TOC entry 178 (class 1259 OID 32871)
+-- Name: histories_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE histories_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.histories_id_seq OWNER TO om;
+
+--
+-- TOC entry 2187 (class 0 OID 0)
+-- Dependencies: 178
+-- Name: histories_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE histories_id_seq OWNED BY histories.id;
+
+
+--
+-- TOC entry 2188 (class 0 OID 0)
+-- Dependencies: 178
+-- Name: histories_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('histories_id_seq', 21, true);
+
+
+--
+-- TOC entry 171 (class 1259 OID 32808)
+-- Name: houses; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE houses (
+    id integer NOT NULL,
+    street text,
+    num text,
+    sqstair real,
+    sqfooter real
+);
+
+
+ALTER TABLE gks.houses OWNER TO om;
+
+--
+-- TOC entry 170 (class 1259 OID 32806)
+-- Name: houses_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE houses_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.houses_id_seq OWNER TO om;
+
+--
+-- TOC entry 2189 (class 0 OID 0)
+-- Dependencies: 170
+-- Name: houses_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE houses_id_seq OWNED BY houses.id;
+
+
+--
+-- TOC entry 2190 (class 0 OID 0)
+-- Dependencies: 170
+-- Name: houses_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('houses_id_seq', 4, true);
+
+
+--
+-- TOC entry 212 (class 1259 OID 106505)
+-- Name: orgs; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE orgs (
+    id integer NOT NULL,
+    name text NOT NULL
+);
+
+
+ALTER TABLE gks.orgs OWNER TO om;
+
+--
+-- TOC entry 211 (class 1259 OID 106503)
+-- Name: orgs_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE orgs_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.orgs_id_seq OWNER TO om;
+
+--
+-- TOC entry 2191 (class 0 OID 0)
+-- Dependencies: 211
+-- Name: orgs_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE orgs_id_seq OWNED BY orgs.id;
+
+
+--
+-- TOC entry 2192 (class 0 OID 0)
+-- Dependencies: 211
+-- Name: orgs_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('orgs_id_seq', 3, true);
+
+
+--
+-- TOC entry 190 (class 1259 OID 41001)
+-- Name: owners; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE owners (
+    id integer NOT NULL,
+    acc_id integer NOT NULL,
+    pes_id integer NOT NULL,
+    since date DEFAULT now() NOT NULL,
+    finish date,
+    cmt text
+);
+
+
+ALTER TABLE gks.owners OWNER TO om;
+
+--
+-- TOC entry 189 (class 1259 OID 40999)
+-- Name: owners_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE owners_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.owners_id_seq OWNER TO om;
+
+--
+-- TOC entry 2193 (class 0 OID 0)
+-- Dependencies: 189
+-- Name: owners_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE owners_id_seq OWNED BY owners.id;
+
+
+--
+-- TOC entry 2194 (class 0 OID 0)
+-- Dependencies: 189
+-- Name: owners_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('owners_id_seq', 1, false);
+
+
+--
+-- TOC entry 192 (class 1259 OID 41013)
+-- Name: peoples; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE peoples (
+    id integer NOT NULL,
+    name text NOT NULL
+);
+
+
+ALTER TABLE gks.peoples OWNER TO om;
+
+--
+-- TOC entry 191 (class 1259 OID 41011)
+-- Name: peoples_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE peoples_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.peoples_id_seq OWNER TO om;
+
+--
+-- TOC entry 2195 (class 0 OID 0)
+-- Dependencies: 191
+-- Name: peoples_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE peoples_id_seq OWNED BY peoples.id;
+
+
+--
+-- TOC entry 2196 (class 0 OID 0)
+-- Dependencies: 191
+-- Name: peoples_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('peoples_id_seq', 1, false);
+
+
+--
+-- TOC entry 194 (class 1259 OID 49172)
+-- Name: periods; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE periods (
+    id integer NOT NULL,
+    since date NOT NULL,
+    finish date,
+    cmt text
+);
+
+
+ALTER TABLE gks.periods OWNER TO om;
+
+--
+-- TOC entry 193 (class 1259 OID 49170)
+-- Name: periods_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE periods_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.periods_id_seq OWNER TO om;
+
+--
+-- TOC entry 2197 (class 0 OID 0)
+-- Dependencies: 193
+-- Name: periods_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE periods_id_seq OWNED BY periods.id;
+
+
+--
+-- TOC entry 2198 (class 0 OID 0)
+-- Dependencies: 193
+-- Name: periods_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('periods_id_seq', 4, true);
+
+
+--
+-- TOC entry 173 (class 1259 OID 32841)
+-- Name: prices; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE prices (
+    id integer NOT NULL,
+    srv_id integer NOT NULL,
+    date date DEFAULT ('now'::text)::date NOT NULL,
+    sum real
+);
+
+
+ALTER TABLE gks.prices OWNER TO om;
+
+--
+-- TOC entry 172 (class 1259 OID 32839)
+-- Name: prices_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE prices_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.prices_id_seq OWNER TO om;
+
+--
+-- TOC entry 2199 (class 0 OID 0)
+-- Dependencies: 172
+-- Name: prices_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE prices_id_seq OWNED BY prices.id;
+
+
+--
+-- TOC entry 2200 (class 0 OID 0)
+-- Dependencies: 172
+-- Name: prices_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('prices_id_seq', 5, true);
+
+
+--
+-- TOC entry 207 (class 1259 OID 90188)
+-- Name: recalc_moneys; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE recalc_moneys (
+    id integer NOT NULL,
+    rclc_id integer NOT NULL,
+    acc_id integer NOT NULL,
+    srv_id integer NOT NULL,
+    sum real DEFAULT 0
+);
+
+
+ALTER TABLE gks.recalc_moneys OWNER TO om;
+
+--
+-- TOC entry 206 (class 1259 OID 90186)
+-- Name: recalc_moneys_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE recalc_moneys_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.recalc_moneys_id_seq OWNER TO om;
+
+--
+-- TOC entry 2201 (class 0 OID 0)
+-- Dependencies: 206
+-- Name: recalc_moneys_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE recalc_moneys_id_seq OWNED BY recalc_moneys.id;
+
+
+--
+-- TOC entry 2202 (class 0 OID 0)
+-- Dependencies: 206
+-- Name: recalc_moneys_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('recalc_moneys_id_seq', 1, true);
+
+
+--
+-- TOC entry 205 (class 1259 OID 90176)
+-- Name: recalcs; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE recalcs (
+    id integer NOT NULL,
+    rdate date DEFAULT (now())::date,
+    description text
+);
+
+
+ALTER TABLE gks.recalcs OWNER TO om;
+
+--
+-- TOC entry 204 (class 1259 OID 90174)
+-- Name: recalcs_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE recalcs_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.recalcs_id_seq OWNER TO om;
+
+--
+-- TOC entry 2203 (class 0 OID 0)
+-- Dependencies: 204
+-- Name: recalcs_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE recalcs_id_seq OWNED BY recalcs.id;
+
+
+--
+-- TOC entry 2204 (class 0 OID 0)
+-- Dependencies: 204
+-- Name: recalcs_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('recalcs_id_seq', 3, true);
+
+
+--
+-- TOC entry 202 (class 1259 OID 90157)
+-- Name: saldo; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE saldo (
+    id integer NOT NULL,
+    acc integer NOT NULL,
+    per_id integer NOT NULL,
+    rest real DEFAULT 0,
+    cred real DEFAULT 0,
+    rclc real DEFAULT 0,
+    debt real DEFAULT 0
+);
+
+
+ALTER TABLE gks.saldo OWNER TO om;
+
+--
+-- TOC entry 201 (class 1259 OID 90155)
+-- Name: saldo_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE saldo_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.saldo_id_seq OWNER TO om;
+
+--
+-- TOC entry 2205 (class 0 OID 0)
+-- Dependencies: 201
+-- Name: saldo_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE saldo_id_seq OWNED BY saldo.id;
+
+
+--
+-- TOC entry 2206 (class 0 OID 0)
+-- Dependencies: 201
+-- Name: saldo_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('saldo_id_seq', 1, true);
+
+
+--
+-- TOC entry 177 (class 1259 OID 32861)
+-- Name: serv_applications; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE serv_applications (
+    id integer NOT NULL,
+    acc_id integer,
+    srv_id integer,
+    since date DEFAULT (now())::date NOT NULL,
+    finish date,
+    coef real,
+    cnt_id integer,
+    isod boolean DEFAULT false NOT NULL
+);
+
+
+ALTER TABLE gks.serv_applications OWNER TO om;
+
+--
+-- TOC entry 2207 (class 0 OID 0)
+-- Dependencies: 177
+-- Name: COLUMN serv_applications.isod; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN serv_applications.isod IS 'Признак общедомового начисления.
+0 - индивидуальное
+1 - общедомовое';
+
+
+--
+-- TOC entry 176 (class 1259 OID 32859)
+-- Name: serv_applications_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE serv_applications_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.serv_applications_id_seq OWNER TO om;
+
+--
+-- TOC entry 2208 (class 0 OID 0)
+-- Dependencies: 176
+-- Name: serv_applications_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE serv_applications_id_seq OWNED BY serv_applications.id;
+
+
+--
+-- TOC entry 2209 (class 0 OID 0)
+-- Dependencies: 176
+-- Name: serv_applications_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('serv_applications_id_seq', 25, true);
+
+
+--
+-- TOC entry 175 (class 1259 OID 32850)
+-- Name: services; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE services (
+    id integer NOT NULL,
+    description text,
+    abb character(10) NOT NULL,
+    kind integer,
+    org_id integer,
+    queue integer
+);
+
+
+ALTER TABLE gks.services OWNER TO om;
+
+--
+-- TOC entry 2210 (class 0 OID 0)
+-- Dependencies: 175
+-- Name: TABLE services; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON TABLE services IS 'abb - краткое наименование
+description - описание
+kind - тип (0 - просто сумма, 1-на площадь, 2-на количество проживающих)
+org_id - организация, предоставившая услугу
+queue - номер очерединачисления
+
+';
+
+
+--
+-- TOC entry 2211 (class 0 OID 0)
+-- Dependencies: 175
+-- Name: COLUMN services.abb; Type: COMMENT; Schema: gks; Owner: om
+--
+
+COMMENT ON COLUMN services.abb IS 'Аббревиатура';
+
+
+--
+-- TOC entry 174 (class 1259 OID 32848)
+-- Name: services_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE services_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.services_id_seq OWNER TO om;
+
+--
+-- TOC entry 2212 (class 0 OID 0)
+-- Dependencies: 174
+-- Name: services_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE services_id_seq OWNED BY services.id;
+
+
+--
+-- TOC entry 2213 (class 0 OID 0)
+-- Dependencies: 174
+-- Name: services_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('services_id_seq', 5, true);
+
+
+--
+-- TOC entry 196 (class 1259 OID 49185)
+-- Name: states; Type: TABLE; Schema: gks; Owner: om; Tablespace: 
+--
+
+CREATE TABLE states (
+    id integer NOT NULL,
+    username character varying(50),
+    per_id integer,
+    sign text
+);
+
+
+ALTER TABLE gks.states OWNER TO om;
+
+--
+-- TOC entry 195 (class 1259 OID 49183)
+-- Name: states_id_seq; Type: SEQUENCE; Schema: gks; Owner: om
+--
+
+CREATE SEQUENCE states_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE gks.states_id_seq OWNER TO om;
+
+--
+-- TOC entry 2214 (class 0 OID 0)
+-- Dependencies: 195
+-- Name: states_id_seq; Type: SEQUENCE OWNED BY; Schema: gks; Owner: om
+--
+
+ALTER SEQUENCE states_id_seq OWNED BY states.id;
+
+
+--
+-- TOC entry 2215 (class 0 OID 0)
+-- Dependencies: 195
+-- Name: states_id_seq; Type: SEQUENCE SET; Schema: gks; Owner: om
+--
+
+SELECT pg_catalog.setval('states_id_seq', 1, true);
+
+
+--
+-- TOC entry 197 (class 1259 OID 57344)
+-- Name: v_histories_current; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_histories_current AS
+    SELECT histories.id, histories.acc_id, histories.howner, histories.sql, histories.own, histories.pes, histories.cmt FROM histories WHERE (histories.chdate = (SELECT max(h.chdate) AS max FROM histories h WHERE ((h.acc_id = histories.acc_id) AND (h.chdate <= ('now'::text)::date))));
+
+
+ALTER TABLE gks.v_histories_current OWNER TO om;
+
+--
+-- TOC entry 198 (class 1259 OID 57371)
+-- Name: v_account_current_details; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_account_current_details AS
+    SELECT accounts.acc, houses.street, houses.num, accounts.flat, houses.sqstair, houses.sqfooter, accounts.since, accounts.finish, accounts.cmt AS acmt, v_histories_current.howner, v_histories_current.sql, v_histories_current.own, v_histories_current.pes, v_histories_current.cmt AS hcmt FROM ((accounts LEFT JOIN v_histories_current ON ((accounts.acc = v_histories_current.acc_id))) LEFT JOIN houses ON ((accounts.hou_id = houses.id)));
+
+
+ALTER TABLE gks.v_account_current_details OWNER TO om;
+
+--
+-- TOC entry 209 (class 1259 OID 90205)
+-- Name: v_counters_linked; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_counters_linked AS
+    SELECT counters.id AS cnt_id, accounts.acc AS acc_id, ((((houses.street || ' '::text) || houses.num) || '-'::text) || accounts.flat) AS address, services.description AS srv_name, serv_applications.isod, counters.description FROM ((((counters LEFT JOIN serv_applications ON ((counters.id = serv_applications.cnt_id))) LEFT JOIN services ON ((serv_applications.srv_id = services.id))) LEFT JOIN accounts ON ((serv_applications.acc_id = accounts.acc))) LEFT JOIN houses ON ((accounts.hou_id = houses.id)));
+
+
+ALTER TABLE gks.v_counters_linked OWNER TO om;
+
+--
+-- TOC entry 210 (class 1259 OID 98304)
+-- Name: v_cred_by_serv_current; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_cred_by_serv_current AS
+    SELECT (t.f).acc AS acc, f_period_current() AS per_id, (t.f).srv_id AS srv_id, services.description, (t.f).isod AS isod, sum((t.f).credsum) AS cred, sum((t.f).countsum) AS count, sum((t.f).rclcsum) AS rclc FROM ((SELECT calc_account(accounts.acc) AS f FROM accounts) t LEFT JOIN services ON (((t.f).srv_id = services.id))) GROUP BY (t.f).acc, (t.f).srv_id, services.description, (t.f).isod;
+
+
+ALTER TABLE gks.v_cred_by_serv_current OWNER TO om;
+
+--
+-- TOC entry 199 (class 1259 OID 73759)
+-- Name: v_house_sql_current; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_house_sql_current AS
+    SELECT accounts.hou_id, sum(histories.sql) AS sum FROM (accounts LEFT JOIN histories ON ((accounts.acc = histories.acc_id))) WHERE (histories.chdate = (SELECT max(h.chdate) AS max FROM histories h WHERE ((h.acc_id = histories.acc_id) AND (h.chdate <= ('now'::text)::date)))) GROUP BY accounts.hou_id;
+
+
+ALTER TABLE gks.v_house_sql_current OWNER TO om;
+
+--
+-- TOC entry 203 (class 1259 OID 90167)
+-- Name: v_saldo_current; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_saldo_current AS
+    SELECT saldo.acc, saldo.per_id, saldo.rest, saldo.cred, saldo.rclc, saldo.debt FROM saldo WHERE (saldo.per_id < f_period_current()) UNION SELECT (t.f).acc AS acc, f_period_current() AS per_id, 0 AS rest, (sum((t.f).credsum) + sum((t.f).countsum)) AS cred, sum((t.f).rclcsum) AS rclc, 0 AS debt FROM (SELECT calc_account(accounts.acc) AS f FROM accounts) t GROUP BY (t.f).acc;
+
+
+ALTER TABLE gks.v_saldo_current OWNER TO om;
+
+--
+-- TOC entry 208 (class 1259 OID 90201)
+-- Name: v_service_applications; Type: VIEW; Schema: gks; Owner: om
+--
+
+CREATE VIEW v_service_applications AS
+    SELECT serv_applications.id, serv_applications.acc_id, serv_applications.srv_id, serv_applications.since, serv_applications.finish, serv_applications.coef, services.description, services.abb, services.kind, services.org_id, services.queue, serv_applications.isod, serv_applications.cnt_id FROM (serv_applications RIGHT JOIN services ON ((serv_applications.srv_id = services.id)));
+
+
+ALTER TABLE gks.v_service_applications OWNER TO om;
+
+--
+-- TOC entry 2097 (class 2604 OID 40976)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY balances ALTER COLUMN id SET DEFAULT nextval('balances_id_seq'::regclass);
+
+
+--
+-- TOC entry 2095 (class 2604 OID 32928)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY counter_checks ALTER COLUMN id SET DEFAULT nextval('counter_checks_id_seq'::regclass);
+
+
+--
+-- TOC entry 2091 (class 2604 OID 32907)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY counter_values ALTER COLUMN id SET DEFAULT nextval('counter_values_id_seq'::regclass);
+
+
+--
+-- TOC entry 2089 (class 2604 OID 32889)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY counters ALTER COLUMN id SET DEFAULT nextval('counters_id_seq'::regclass);
+
+
+--
+-- TOC entry 2087 (class 2604 OID 32876)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY histories ALTER COLUMN id SET DEFAULT nextval('histories_id_seq'::regclass);
+
+
+--
+-- TOC entry 2080 (class 2604 OID 32811)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY houses ALTER COLUMN id SET DEFAULT nextval('houses_id_seq'::regclass);
+
+
+--
+-- TOC entry 2113 (class 2604 OID 106508)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY orgs ALTER COLUMN id SET DEFAULT nextval('orgs_id_seq'::regclass);
+
+
+--
+-- TOC entry 2099 (class 2604 OID 41004)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY owners ALTER COLUMN id SET DEFAULT nextval('owners_id_seq'::regclass);
+
+
+--
+-- TOC entry 2101 (class 2604 OID 41016)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY peoples ALTER COLUMN id SET DEFAULT nextval('peoples_id_seq'::regclass);
+
+
+--
+-- TOC entry 2102 (class 2604 OID 49175)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY periods ALTER COLUMN id SET DEFAULT nextval('periods_id_seq'::regclass);
+
+
+--
+-- TOC entry 2081 (class 2604 OID 32844)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY prices ALTER COLUMN id SET DEFAULT nextval('prices_id_seq'::regclass);
+
+
+--
+-- TOC entry 2111 (class 2604 OID 90191)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY recalc_moneys ALTER COLUMN id SET DEFAULT nextval('recalc_moneys_id_seq'::regclass);
+
+
+--
+-- TOC entry 2109 (class 2604 OID 90179)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY recalcs ALTER COLUMN id SET DEFAULT nextval('recalcs_id_seq'::regclass);
+
+
+--
+-- TOC entry 2104 (class 2604 OID 90160)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY saldo ALTER COLUMN id SET DEFAULT nextval('saldo_id_seq'::regclass);
+
+
+--
+-- TOC entry 2085 (class 2604 OID 32864)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY serv_applications ALTER COLUMN id SET DEFAULT nextval('serv_applications_id_seq'::regclass);
+
+
+--
+-- TOC entry 2083 (class 2604 OID 32853)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY services ALTER COLUMN id SET DEFAULT nextval('services_id_seq'::regclass);
+
+
+--
+-- TOC entry 2103 (class 2604 OID 49188)
+-- Name: id; Type: DEFAULT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY states ALTER COLUMN id SET DEFAULT nextval('states_id_seq'::regclass);
+
+
+--
+-- TOC entry 2161 (class 0 OID 40990)
+-- Dependencies: 188
+-- Data for Name: accounts; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY accounts (acc, hou_id, flat, since, finish, cmt) FROM stdin;
+40101	1	1	2012-11-01	\N	\N
+40102	1	2	2012-10-01	\N	111
+38174	4	2	2012-12-16	\N	
+38175	4	3	2012-12-01	\N	
+38176	4	4	2012-12-01	\N	
+38177	4	5	2012-12-01	\N	
+38178	4	6	2012-12-01	\N	
+38179	4	7	2012-12-01	\N	
+38180	4	8	2012-12-01	\N	
+38181	4	9	2012-12-01	\N	
+38182	4	10	2012-12-01	\N	
+38183	4	11	2012-12-01	\N	
+38184	4	12	2012-12-01	\N	
+38173	4	1	2012-12-01	\N	Эип\r\n333ууукк\r\n1232135555\r\n5454
+\.
+
+
+--
+-- TOC entry 2160 (class 0 OID 40973)
+-- Dependencies: 187
+-- Data for Name: balances; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY balances (id, per_id, acc_id, beg, cred, rclc, deb) FROM stdin;
+\.
+
+
+--
+-- TOC entry 2159 (class 0 OID 32925)
+-- Dependencies: 185
+-- Data for Name: counter_checks; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY counter_checks (id, cnt_id, checkdate, nextcheck, plomba) FROM stdin;
+\.
+
+
+--
+-- TOC entry 2158 (class 0 OID 32904)
+-- Dependencies: 183
+-- Data for Name: counter_values; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY counter_values (id, cnt_id, checkdate, isnew, reading, auto) FROM stdin;
+1	1	2012-10-01	f	122	f
+2	1	2012-11-15	t	3	f
+3	1	2012-12-13	f	4	f
+4	4	2012-12-01	t	0	f
+6	3	2012-12-01	t	0	f
+5	4	2012-12-15	f	12	f
+7	3	2012-12-18	f	2	f
+8	17	2013-01-01	t	0	f
+9	17	2013-01-20	f	1	f
+\.
+
+
+--
+-- TOC entry 2157 (class 0 OID 32886)
+-- Dependencies: 181
+-- Data for Name: counters; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY counters (id, since, finish, description, serial_number) FROM stdin;
+3	2012-01-01	\N	Первый счётчик. Описание. Для тестов. мигрирует.	\N
+4	2012-12-15	\N	Новый счётчик	\N
+1	2012-10-01	\N	111111	\N
+5	2012-12-22	\N	Пустой	\N
+6	2013-01-09	\N	Счётчик создан Wed Jan 09 00:04:36 YAKT 2013	\N
+7	2013-01-09	\N	Счётчик создан Wed Jan 09 00:04:59 YAKT 2013	\N
+8	2013-01-11	\N	Счётчик создан Fri Jan 11 21:15:33 YAKT 2013	\N
+9	2013-01-11	\N	Счётчик создан Fri Jan 11 21:16:38 YAKT 2013	\N
+10	2013-01-11	\N	Счётчик создан Fri Jan 11 21:18:12 YAKT 2013	\N
+11	2013-01-11	\N	Счётчик создан Fri Jan 11 21:24:23 YAKT 2013	\N
+12	2013-01-11	\N	Счётчик создан Fri Jan 11 21:25:58 YAKT 2013	\N
+13	2013-01-11	\N	Счётчик создан Fri Jan 11 23:15:50 YAKT 2013	\N
+14	2013-01-11	\N	Счётчик создан Fri Jan 11 23:16:56 YAKT 2013	\N
+15	2013-01-11	\N	Счётчик создан Fri Jan 11 23:21:14 YAKT 2013	\N
+16	2013-01-11	\N	Счётчик создан Fri Jan 11 23:23:00 YAKT 2013	\N
+17	2013-01-11	\N	Счётчик создан Fri Jan 11 23:30:14 YAKT 2013	\N
+\.
+
+
+--
+-- TOC entry 2156 (class 0 OID 32873)
+-- Dependencies: 179
+-- Data for Name: histories; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY histories (id, acc_id, chdate, id_owner, sql, own, pes, cmt, howner) FROM stdin;
+1	40101	2012-11-01	\N	59.4000015	2006-05-05	0	\N	\N
+2	40101	2012-11-25	1	59.4000015	2006-05-05	1	\N	\N
+3	40101	2012-11-28	1	59.4000015	2006-05-05	1	test	Павлова Л.В.
+4	40102	2012-10-01	0	36.2999992	2006-05-15	0	\N	Павлова Л.В.
+5	40102	2012-12-16	\N	36.2999992	2006-05-15	1	111	Павлова Л.В.
+6	38173	2012-12-01	\N	50.5	\N	4	\N	Секисова Е.К.
+9	38174	2012-12-01	\N	40.9000015	1995-12-28	1	\N	Афанасьев М.В.
+10	38175	2012-12-01	\N	31.1000004	2002-12-11	1	\N	Мулькова Л.И.
+11	38176	2012-12-01	\N	53.0999985	1995-03-16	2	\N	Бабак Е.В.
+12	38177	2012-12-01	\N	41	2012-12-16	2	\N	Магомаева Александра Владимировна
+13	38178	2012-12-01	\N	30.3999996	1993-11-10	1	\N	Степкина Нина Фёдоровна
+14	38179	2012-12-01	\N	31.6000004	2004-04-07	1	\N	Исаева М.С.
+15	38180	2012-12-01	\N	40.2999992	2005-10-18	2	\N	Смолина А.А.
+16	38181	2012-12-01	\N	54.7999992	1994-02-15	0	\N	Крючкова Нина Владимировна
+17	38182	2012-12-01	\N	31	2006-11-30	1	\N	Рудич А.С.
+18	38183	2012-12-01	\N	41.5999985	2006-07-04	2	\N	Смирнова О.П.
+19	38184	2012-12-01	\N	53.0999985	2003-10-07	0	\N	Мельинкова Светлана Евгеньевна, Мельников Дмитрий Александрович, Мельникова Полина Дмитриевна
+20	38173	2012-12-22	\N	50.5	2012-12-22	4	1\r\n2\r\n3\r\n4\r\n	Секисова Е.К.
+21	40101	2013-01-01	\N	59.4000015	2006-05-05	1	test	Павлова Л.В.
+\.
+
+
+--
+-- TOC entry 2152 (class 0 OID 32808)
+-- Dependencies: 171
+-- Data for Name: houses; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY houses (id, street, num, sqstair, sqfooter) FROM stdin;
+2	Светлый	2	480	1400
+3	Светлый	3	448	1500
+1	Светлый	1	447	1532
+4	Октябрьская	27	44.2000008	0
+\.
+
+
+--
+-- TOC entry 2169 (class 0 OID 106505)
+-- Dependencies: 212
+-- Data for Name: orgs; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY orgs (id, name) FROM stdin;
+1	Неизвестная организация
+2	Касса
+3	ОАО АК СБ РФ
+\.
+
+
+--
+-- TOC entry 2162 (class 0 OID 41001)
+-- Dependencies: 190
+-- Data for Name: owners; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY owners (id, acc_id, pes_id, since, finish, cmt) FROM stdin;
+\.
+
+
+--
+-- TOC entry 2163 (class 0 OID 41013)
+-- Dependencies: 192
+-- Data for Name: peoples; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY peoples (id, name) FROM stdin;
+1	Павлова Лариса Валентиновна
+\.
+
+
+--
+-- TOC entry 2164 (class 0 OID 49172)
+-- Dependencies: 194
+-- Data for Name: periods; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY periods (id, since, finish, cmt) FROM stdin;
+1	2012-11-01	\N	\N
+2	2012-12-01	\N	\N
+3	2013-01-01	\N	\N
+4	2013-02-01	\N	\N
+\.
+
+
+--
+-- TOC entry 2153 (class 0 OID 32841)
+-- Dependencies: 173
+-- Data for Name: prices; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY prices (id, srv_id, date, sum) FROM stdin;
+1	2	2012-01-01	32.8100014
+4	3	2012-10-01	109.260002
+3	5	2012-10-01	36.4300003
+2	4	2012-10-01	22.4099998
+\.
+
+
+--
+-- TOC entry 2168 (class 0 OID 90188)
+-- Dependencies: 207
+-- Data for Name: recalc_moneys; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY recalc_moneys (id, rclc_id, acc_id, srv_id, sum) FROM stdin;
+\.
+
+
+--
+-- TOC entry 2167 (class 0 OID 90176)
+-- Dependencies: 205
+-- Data for Name: recalcs; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY recalcs (id, rdate, description) FROM stdin;
+2	2012-12-01	Перерасчёт1
+3	2012-12-12	111111 0222222 2222 33333 4545454 68888 4444 22222
+\.
+
+
+--
+-- TOC entry 2166 (class 0 OID 90157)
+-- Dependencies: 202
+-- Data for Name: saldo; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY saldo (id, acc, per_id, rest, cred, rclc, debt) FROM stdin;
+1	40101	1	0	0	0	0
+\.
+
+
+--
+-- TOC entry 2155 (class 0 OID 32861)
+-- Dependencies: 177
+-- Data for Name: serv_applications; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY serv_applications (id, acc_id, srv_id, since, finish, coef, cnt_id, isod) FROM stdin;
+6	40102	4	2012-11-01	\N	1	\N	f
+7	38173	5	2012-12-01	\N	1	\N	f
+8	38173	2	2012-12-01	\N	1	4	t
+10	38174	2	2012-12-01	\N	4.4000001	\N	f
+11	38175	2	2012-12-10	\N	4.4000001	\N	f
+12	38175	2	2012-12-01	\N	1	3	f
+1	40101	2	2012-11-01	2013-01-15	4.4000001	0	f
+25	40101	2	2013-01-15	\N	1	17	f
+\.
+
+
+--
+-- TOC entry 2154 (class 0 OID 32850)
+-- Dependencies: 175
+-- Data for Name: services; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY services (id, description, abb, kind, org_id, queue) FROM stdin;
+2	Холодная вода (ООО ЗТС)	ХВ        	2	1	1
+3	Горячая вода	ГВ        	2	1	2
+5	Отопление пос.Временный	ОТВр      	1	\N	\N
+4	Содержание домохозяйства	СДХ       	1	\N	\N
+\.
+
+
+--
+-- TOC entry 2165 (class 0 OID 49185)
+-- Dependencies: 196
+-- Data for Name: states; Type: TABLE DATA; Schema: gks; Owner: om
+--
+
+COPY states (id, username, per_id, sign) FROM stdin;
+1	\N	3	Директор  Кузнецов
+\.
+
+
+--
+-- TOC entry 2133 (class 2606 OID 40998)
+-- Name: acc_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY accounts
+    ADD CONSTRAINT acc_pk PRIMARY KEY (acc);
+
+
+--
+-- TOC entry 2131 (class 2606 OID 40978)
+-- Name: balances_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY balances
+    ADD CONSTRAINT balances_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2129 (class 2606 OID 32934)
+-- Name: counter_checks_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY counter_checks
+    ADD CONSTRAINT counter_checks_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2127 (class 2606 OID 32910)
+-- Name: counter_values_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY counter_values
+    ADD CONSTRAINT counter_values_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2125 (class 2606 OID 32892)
+-- Name: counters_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY counters
+    ADD CONSTRAINT counters_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2123 (class 2606 OID 32882)
+-- Name: histories_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY histories
+    ADD CONSTRAINT histories_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2115 (class 2606 OID 32816)
+-- Name: houses_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY houses
+    ADD CONSTRAINT houses_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2149 (class 2606 OID 106513)
+-- Name: orgs_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY orgs
+    ADD CONSTRAINT orgs_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2135 (class 2606 OID 41010)
+-- Name: owners_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY owners
+    ADD CONSTRAINT owners_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2137 (class 2606 OID 41021)
+-- Name: peoples_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY peoples
+    ADD CONSTRAINT peoples_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2139 (class 2606 OID 49180)
+-- Name: periods_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY periods
+    ADD CONSTRAINT periods_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2117 (class 2606 OID 32847)
+-- Name: prices_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY prices
+    ADD CONSTRAINT prices_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2147 (class 2606 OID 90194)
+-- Name: recalc_moneys_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY recalc_moneys
+    ADD CONSTRAINT recalc_moneys_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2145 (class 2606 OID 90185)
+-- Name: recalcs_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY recalcs
+    ADD CONSTRAINT recalcs_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2143 (class 2606 OID 90166)
+-- Name: saldo_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY saldo
+    ADD CONSTRAINT saldo_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2121 (class 2606 OID 32867)
+-- Name: serv_applications_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY serv_applications
+    ADD CONSTRAINT serv_applications_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2119 (class 2606 OID 32858)
+-- Name: services_pk; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY services
+    ADD CONSTRAINT services_pk PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2141 (class 2606 OID 49193)
+-- Name: states_id; Type: CONSTRAINT; Schema: gks; Owner: om; Tablespace: 
+--
+
+ALTER TABLE ONLY states
+    ADD CONSTRAINT states_id PRIMARY KEY (id);
+
+
+--
+-- TOC entry 2151 (class 2620 OID 106499)
+-- Name: tg_serv_applications_check_delete; Type: TRIGGER; Schema: gks; Owner: om
+--
+
+CREATE TRIGGER tg_serv_applications_check_delete BEFORE DELETE ON serv_applications FOR EACH ROW EXECUTE PROCEDURE tg_serv_applications_check_delete();
+
+
+--
+-- TOC entry 2150 (class 2606 OID 90195)
+-- Name: recalc_moneys_rclc_id_fkey; Type: FK CONSTRAINT; Schema: gks; Owner: om
+--
+
+ALTER TABLE ONLY recalc_moneys
+    ADD CONSTRAINT recalc_moneys_rclc_id_fkey FOREIGN KEY (rclc_id) REFERENCES recalcs(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+-- Completed on 2013-01-12 14:49:37
+
+--
+-- PostgreSQL database dump complete
+--
+

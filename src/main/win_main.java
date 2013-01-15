@@ -35,7 +35,6 @@ public class win_main extends JFrame{
 	        JMenu menuCntr = new JMenu("Счётчики");
 	        JMenu menuRclc = new JMenu("Перерасчёты");
 	        JMenu menuCash = new JMenu("Оплата");
-	        menuCash.setEnabled(false);
 	        
 	        JMenu menuPret = new JMenu("Претензионная работа");
 	        menuPret.setEnabled(false);
@@ -70,6 +69,7 @@ public class win_main extends JFrame{
 	        JMenuItem item03 = new JMenuItem("Услуги");
 	        JMenuItem item04 = new JMenuItem("Цены");
 	        JMenuItem item05 = new JMenuItem("Периоды начисления");
+	        JMenuItem item06 = new JMenuItem("Организации");
 
 	        item02.addActionListener(new java.awt.event.ActionListener() {
 		         public void actionPerformed(ActionEvent e)
@@ -105,7 +105,8 @@ public class win_main extends JFrame{
 	        menuList.add(item03);
 	        menuList.add(item04);
 	        menuList.add(item05);
-
+	        menuList.add(item06);
+	        
 	        JMenuItem item11 = new JMenuItem("Паспорта счётчиков");
 	        JMenuItem item12 = new JMenuItem("Состояние счётчиков");
 	        
@@ -140,12 +141,25 @@ public class win_main extends JFrame{
 	        
 	        menuRclc.add(item21);
 
-	        JMenuItem item31 = new JMenuItem("Касса");
-	        JMenuItem item32 = new JMenuItem("Подтверждение оплаты");
+	        JMenuItem item31 = new JMenuItem("Создать новый пакет оплаты");
+	        JMenuItem item32 = new JMenuItem("Список пакетов");
 	        JMenuItem item33 = new JMenuItem("Загрузка из файла");
+	        item33.setEnabled(false);
 	        JMenuItem item34 = new JMenuItem("Выгрузка в банк");
+	        item34.setEnabled(false);
 	        JMenuItem item35 = new JMenuItem("Оплата за день");
+	        item35.setEnabled(false);
 	        JMenuItem item36 = new JMenuItem("Оплата за период");
+	        item36.setEnabled(false);
+	        
+	        item31.addActionListener(new java.awt.event.ActionListener() {
+		         public void actionPerformed(ActionEvent e)
+		         {
+		        	 
+		        	 new WinDebet(1).setVisible(true);
+		         }
+		        });
+	        
 	        
 	        menuCash.add(item31); 
 	        menuCash.add(item32);

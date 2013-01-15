@@ -457,7 +457,8 @@ public class WinAccount extends JFrame{
     
 		@Override
 		public Class<?> getColumnClass(int c) {
-			if (getValueAt(0, c) == null) return Date.class;
+			
+			if (getValueAt(0, c) == null) return String.class;
 //			System.out.println(c +": "+ getValueAt(0, c).getClass() + " " + getValueAt(0, c));
 	        return getValueAt(0, c).getClass();
 	    }
